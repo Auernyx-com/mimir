@@ -73,10 +73,20 @@ class MimirHandler(BaseHTTPRequestHandler):
             elif self.path == "/resolve_conflict":
                 storage.resolve_conflict(self.conn, body["conflict_id"], body["resolution"])
                 self._ok({"resolved": True})
+            elif self.path == "/link":
+                storage.add_link(self.conn, body["from_id"], body["to_id"])
+                self._ok({"linked": True})
+            elif self.path == "/unlink":
+                storage.remove_link(self.conn, body["from_id"], body["to_id"])
+                self._ok({"unlinked": True})
+            elif self.path == "/links":
+                self._ok(storage.get_links(self.conn, body["node_id"]))
             else:
                 self._fail(404, "unknown_route", f"no such route: {self.path}")
         except storage.AuthorizationError as e:
             self._fail(403, "authorization_required", str(e))
+        except storage.NotFoundError as e:
+            self._fail(404, "not_found", str(e))
         except KeyError as e:
             self._fail(400, "missing_field", f"missing required field: {e}")
         except ValueError as e:

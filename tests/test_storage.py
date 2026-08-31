@@ -277,8 +277,8 @@ def test_resolve_conflict_rejects_unknown_id():
     conn = _fresh_conn()
     try:
         storage.resolve_conflict(conn, "does-not-exist", "picked A")
-        assert False, "expected KeyError"
-    except KeyError:
+        assert False, "expected NotFoundError"
+    except storage.NotFoundError:
         pass
 
 
@@ -290,9 +290,47 @@ def test_resolve_conflict_rejects_already_resolved_id():
     storage.resolve_conflict(conn, conflict_id, "picked A")
     try:
         storage.resolve_conflict(conn, conflict_id, "picked B")
-        assert False, "expected KeyError on double-resolve"
-    except KeyError:
+        assert False, "expected NotFoundError on double-resolve"
+    except storage.NotFoundError:
         pass
+
+
+def test_add_link_and_get_links_both_directions():
+    conn = _fresh_conn()
+    a = storage.write_node(conn, layer="branch", topic="a", content="x", authored_by="t", origin_machine="t")
+    b = storage.write_node(conn, layer="branch", topic="b", content="x", authored_by="t", origin_machine="t")
+    storage.add_link(conn, a.id, b.id)
+    assert storage.get_links(conn, a.id) == {"outgoing": [b.id], "incoming": []}
+    assert storage.get_links(conn, b.id) == {"outgoing": [], "incoming": [a.id]}
+
+
+def test_add_link_rejects_nonexistent_node():
+    conn = _fresh_conn()
+    a = storage.write_node(conn, layer="branch", topic="a", content="x", authored_by="t", origin_machine="t")
+    try:
+        storage.add_link(conn, a.id, "does-not-exist")
+        assert False, "expected NotFoundError"
+    except storage.NotFoundError:
+        pass
+
+
+def test_add_link_is_idempotent():
+    conn = _fresh_conn()
+    a = storage.write_node(conn, layer="branch", topic="a", content="x", authored_by="t", origin_machine="t")
+    b = storage.write_node(conn, layer="branch", topic="b", content="x", authored_by="t", origin_machine="t")
+    storage.add_link(conn, a.id, b.id)
+    storage.add_link(conn, a.id, b.id)  # should not raise, should not duplicate
+    assert storage.get_links(conn, a.id)["outgoing"] == [b.id]
+
+
+def test_remove_link_is_safe_on_a_link_that_never_existed():
+    conn = _fresh_conn()
+    a = storage.write_node(conn, layer="branch", topic="a", content="x", authored_by="t", origin_machine="t")
+    b = storage.write_node(conn, layer="branch", topic="b", content="x", authored_by="t", origin_machine="t")
+    storage.remove_link(conn, a.id, b.id)  # never linked — must not raise
+    storage.add_link(conn, a.id, b.id)
+    storage.remove_link(conn, a.id, b.id)
+    assert storage.get_links(conn, a.id) == {"outgoing": [], "incoming": []}
 
 
 def test_verify_chain_passes_on_untampered_node():

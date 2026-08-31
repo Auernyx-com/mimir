@@ -48,6 +48,17 @@ class AuthorizationError(Exception):
     """Raised when a root/trunk write is missing authorized_by/confirmation."""
 
 
+class NotFoundError(Exception):
+    """Raised when a request refers to an id that doesn't exist — a node,
+    conflict, or link endpoint. Deliberately NOT a plain KeyError: found
+    during hardening that confirm_node/resolve_conflict/add_link all used
+    to raise bare KeyError for this, indistinguishable from a genuinely
+    missing request field (`body["topic"]`), so the HTTP layer wrapped
+    "no such node: bogus" as if "bogus" were a missing_field name — a
+    real, present-but-wrong id got reported back as though the request
+    itself were malformed."""
+
+
 @dataclass
 class Node:
     id: str
@@ -257,7 +268,7 @@ def confirm_node(conn: sqlite3.Connection, node_id: str, actor: str) -> Node:
     being asserted once)."""
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if row is None:
-        raise KeyError(f"no such node: {node_id}")
+        raise NotFoundError(f"no such node: {node_id}")
     node = Node.from_row(row)
 
     confirmations = node.confirmations + 1
@@ -395,5 +406,44 @@ def resolve_conflict(conn: sqlite3.Connection, conflict_id: str, resolution: str
     if cur.rowcount == 0:
         exists = conn.execute("SELECT 1 FROM conflicts WHERE id = ?", (conflict_id,)).fetchone()
         reason = "already resolved" if exists else "no such conflict"
-        raise KeyError(f"cannot resolve conflict {conflict_id!r}: {reason}")
+        raise NotFoundError(f"cannot resolve conflict {conflict_id!r}: {reason}")
     conn.commit()
+
+
+# ── Links — minimal bookkeeping only ────────────────────────────────────────
+#
+# Deliberately not fused into write_node(): a node write partially succeeding
+# while a requested link target turns out invalid is an ambiguity not worth
+# creating. These operate on already-existing nodes only. recall() does NOT
+# traverse links — this is pure "related nodes" bookkeeping (SPEC.md §3),
+# not graph expansion; that's a bigger, separate decision if it's ever
+# wanted later.
+
+def add_link(conn: sqlite3.Connection, from_id: str, to_id: str) -> None:
+    """Directional by storage (from_id, to_id), read back in both
+    directions by get_links(). Idempotent: linking the same pair twice is
+    a no-op, not an error. Raises KeyError if either node doesn't exist,
+    same convention as confirm_node's "no such node"."""
+    for label, node_id in (("from_id", from_id), ("to_id", to_id)):
+        if conn.execute("SELECT 1 FROM nodes WHERE id = ?", (node_id,)).fetchone() is None:
+            raise NotFoundError(f"no such node ({label}): {node_id}")
+    conn.execute("INSERT OR IGNORE INTO links (from_id, to_id) VALUES (?, ?)", (from_id, to_id))
+    conn.commit()
+
+
+def remove_link(conn: sqlite3.Connection, from_id: str, to_id: str) -> None:
+    """No error on removing a link that doesn't exist — matches how
+    duplicate add_link() calls are also silently fine; links have no
+    identity of their own worth protecting with existence checks, unlike
+    conflicts or nodes."""
+    conn.execute("DELETE FROM links WHERE from_id = ? AND to_id = ?", (from_id, to_id))
+    conn.commit()
+
+
+def get_links(conn: sqlite3.Connection, node_id: str) -> dict:
+    """Both directions, labeled separately rather than merged — from_id and
+    to_id mean different things (this node references X vs. X references
+    this node), and collapsing them would lose that."""
+    outgoing = [r["to_id"] for r in conn.execute("SELECT to_id FROM links WHERE from_id = ?", (node_id,))]
+    incoming = [r["from_id"] for r in conn.execute("SELECT from_id FROM links WHERE to_id = ?", (node_id,))]
+    return {"outgoing": outgoing, "incoming": incoming}
