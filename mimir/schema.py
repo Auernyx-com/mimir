@@ -58,6 +58,34 @@ CREATE TABLE IF NOT EXISTS conflicts (
     resolved_at  TEXT,
     resolution   TEXT
 );
+
+-- Branch/leaf recall relevance filtering runs through this, not a Python-side
+-- substring scan of every row — a scale test (scripts/scale_test.py) showed
+-- the naive approach is O(n) in node count (100 nodes: 0.7ms: 20,000 nodes:
+-- 130ms, linear) — it didn't fix recall lag, it relocated it. FTS5 pushes
+-- the search into SQLite's own index instead. External-content table: the
+-- real data stays in `nodes`, this only ever holds the search index.
+CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+    topic, description, content, tags,
+    content='nodes', content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, topic, description, content, tags)
+    VALUES (new.rowid, new.topic, new.description, new.content, new.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, topic, description, content, tags)
+    VALUES ('delete', old.rowid, old.topic, old.description, old.content, old.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, topic, description, content, tags)
+    VALUES ('delete', old.rowid, old.topic, old.description, old.content, old.tags);
+    INSERT INTO nodes_fts(rowid, topic, description, content, tags)
+    VALUES (new.rowid, new.topic, new.description, new.content, new.tags);
+END;
 """
 
 
@@ -70,6 +98,30 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+
+    # Must check for nodes_fts's existence BEFORE running the schema script,
+    # and must check sqlite_master, not row counts: count(*) on an
+    # external-content FTS5 table reads through to its backing table
+    # (`nodes`) regardless of whether the inverted index was ever actually
+    # built, so it's always non-zero once `nodes` has rows — comparing it
+    # to node_count can never detect a stale/never-indexed table. This was
+    # a real bug: it meant `rebuild` never ran, and recall() silently
+    # returned zero branch/leaf matches for a database's entire existing
+    # history, on every node, discovered only by testing recall against
+    # real content and finding known-good matches missing.
+    fts_existed_before = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+    ).fetchone()[0] > 0
+
     conn.executescript(SCHEMA)
+
+    if not fts_existed_before:
+        # First time this database gets an FTS5 index — either it's brand
+        # new (no-op, nothing to index yet) or it predates this schema
+        # version (existing `nodes` rows the triggers never saw). `rebuild`
+        # is FTS5's documented way to build an external-content index from
+        # its backing table from scratch.
+        conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+
     conn.commit()
     return conn

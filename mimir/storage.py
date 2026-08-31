@@ -63,15 +63,62 @@ class Node:
         return cls(**d)
 
 
-def _hash_of(*parts: str) -> str:
-    return hashlib.sha256("|".join(p or "" for p in parts).encode("utf-8")).hexdigest()
+def _advance(conn: sqlite3.Connection, node_id: str, prev_hash: str | None, diff: dict, actor: str) -> str:
+    """The single hashing path for every state change to a node, ever.
 
-
-def _log_edit(conn: sqlite3.Connection, node_id: str, actor: str, diff: dict, chain_hash: str) -> None:
+    One formula, used identically by creation, confirmation, supersession,
+    promotion, and pruning, is what makes verify_chain() possible at all —
+    a chain that computed its hash differently per operation type couldn't
+    be recomputed and checked generically. `diff` is serialized with
+    sort_keys so the same logical diff always hashes the same way regardless
+    of dict insertion order.
+    """
+    new_hash = hashlib.sha256(
+        f"{prev_hash or ''}|{node_id}|{json.dumps(diff, sort_keys=True)}".encode("utf-8")
+    ).hexdigest()
     conn.execute(
         "INSERT INTO edit_log (id, node_id, at, actor, diff, hash) VALUES (?, ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), node_id, _now(), actor, json.dumps(diff), chain_hash),
+        (str(uuid.uuid4()), node_id, _now(), actor, json.dumps(diff, sort_keys=True), new_hash),
     )
+    return new_hash
+
+
+def verify_chain(conn: sqlite3.Connection, node_id: str) -> dict:
+    """Recompute a node's entire hash chain from its edit_log and check it
+    against what's stored. This is what makes "provenance" mean something
+    here rather than just being a hash column nobody ever checks — see
+    SPEC.md §7. Detects: a tampered diff, a tampered hash, entries deleted
+    or reordered, or a live node whose current hash doesn't match the end
+    of its own logged history."""
+    rows = conn.execute(
+        "SELECT * FROM edit_log WHERE node_id = ? ORDER BY rowid ASC", (node_id,)
+    ).fetchall()
+    if not rows:
+        return {"valid": False, "reason": "no edit_log entries for this node_id"}
+
+    prev = None
+    for i, row in enumerate(rows):
+        diff = json.loads(row["diff"])
+        expected = hashlib.sha256(
+            f"{prev or ''}|{node_id}|{json.dumps(diff, sort_keys=True)}".encode("utf-8")
+        ).hexdigest()
+        if expected != row["hash"]:
+            return {
+                "valid": False,
+                "reason": "hash mismatch — chain broken or tampered",
+                "broken_at_entry_index": i,
+                "edit_log_id": row["id"],
+            }
+        prev = row["hash"]
+
+    current = conn.execute("SELECT hash FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    if current is not None and current["hash"] != prev:
+        return {
+            "valid": False,
+            "reason": "live node's hash doesn't match the end of its own edit_log chain",
+        }
+
+    return {"valid": True, "entries_verified": len(rows)}
 
 
 def write_node(
@@ -105,7 +152,7 @@ def write_node(
         if layer == "leaf"
         else None
     )
-    chain_hash = _hash_of(node_id, layer, topic, content, "")  # prev_hash="" — genesis for this node
+    creation_diff = {"created": True, "layer": layer, "topic": topic, "content": content}
 
     existing = conn.execute(
         "SELECT * FROM nodes WHERE topic = ? AND superseded_by IS NULL", (topic,)
@@ -124,7 +171,11 @@ def write_node(
             # Existing node already outranks this new, lower-layer write.
             superseded_by = other.id
 
-    # Insert first so any FK reference to node_id (conflicts, superseded_by) is valid.
+    # Genesis hash for this node — logged to edit_log before the node row
+    # exists (edit_log has no FK on node_id precisely so it can outlive or
+    # precede the row it describes; see schema.py).
+    chain_hash = _advance(conn, node_id, None, creation_diff, authored_by)
+
     conn.execute(
         """INSERT INTO nodes (id, layer, topic, content, description, tags,
                created_at, last_confirmed_at, expires_at, confirmations,
@@ -136,7 +187,6 @@ def write_node(
             authored_by, origin_machine, chain_hash, None, superseded_by,
         ),
     )
-    _log_edit(conn, node_id, authored_by, {"created": True, "layer": layer, "topic": topic}, chain_hash)
 
     for row in existing:
         other = Node.from_row(row)
@@ -147,8 +197,14 @@ def write_node(
             )
         elif _LAYER_RANK[layer] < _LAYER_RANK[other.layer]:
             # New node outranks the existing one — existing one is superseded.
-            conn.execute("UPDATE nodes SET superseded_by = ? WHERE id = ?", (node_id, other.id))
-            _log_edit(conn, other.id, authored_by, {"superseded_by": node_id}, other.hash)
+            # This IS a real state change to `other`, so its chain advances
+            # too — a supersede event that never touched the hash was the
+            # bug this refactor exists to fix.
+            other_new_hash = _advance(conn, other.id, other.hash, {"superseded_by": node_id}, authored_by)
+            conn.execute(
+                "UPDATE nodes SET superseded_by = ?, hash = ?, prev_hash = ? WHERE id = ?",
+                (node_id, other_new_hash, other.hash, other.id),
+            )
 
     conn.commit()
 
@@ -176,17 +232,13 @@ def confirm_node(conn: sqlite3.Connection, node_id: str, actor: str) -> Node:
     elif node.layer == "leaf":
         expires_at = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
 
-    chain_hash = _hash_of(node.id, "confirm", str(confirmations), node.hash)
+    diff = {"confirmations": confirmations, "layer": new_layer, "promoted": new_layer != node.layer}
+    chain_hash = _advance(conn, node.id, node.hash, diff, actor)
 
     conn.execute(
         """UPDATE nodes SET confirmations = ?, last_confirmed_at = ?, layer = ?,
                expires_at = ?, hash = ?, prev_hash = ? WHERE id = ?""",
         (confirmations, now, new_layer, expires_at, chain_hash, node.hash, node.id),
-    )
-    _log_edit(
-        conn, node.id, actor,
-        {"confirmations": confirmations, "layer": new_layer, "promoted": new_layer != node.layer},
-        chain_hash,
     )
     conn.commit()
     return Node.from_row(conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone())
@@ -207,20 +259,37 @@ def recall(conn: sqlite3.Connection, query: str = "", layers: list[str] | None =
         results.extend(Node.from_row(r) for r in rows if r["layer"] in wanted)
 
     if query and ("branch" in wanted or "leaf" in wanted):
-        terms = [t.lower() for t in query.split() if t]
-        rows = conn.execute(
-            """SELECT * FROM nodes WHERE layer IN ('branch','leaf') AND superseded_by IS NULL
-                   AND (expires_at IS NULL OR expires_at > ?)""",
-            (_now(),),
-        ).fetchall()
-        for r in rows:
-            if r["layer"] not in wanted:
-                continue
-            haystack = f"{r['topic']} {r['description']} {r['content']} {r['tags']}".lower()
-            if any(term in haystack for term in terms):
-                results.append(Node.from_row(r))
+        fts_query = _fts_match_query(query)
+        if fts_query:
+            # Written as `rowid IN (subquery)` rather than a JOIN — measured
+            # directly (scripts/scale_test.py): a JOIN lets SQLite's planner
+            # pick "scan every branch/leaf row, probe FTS5 per row" instead
+            # of "search the FTS5 index first" — 285ms vs 6.6ms at 5,000
+            # nodes for the exact same query. The subquery form reliably
+            # forces the index search to run first.
+            rows = conn.execute(
+                """SELECT * FROM nodes
+                       WHERE rowid IN (SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?)
+                         AND layer IN ('branch','leaf')
+                         AND superseded_by IS NULL
+                         AND (expires_at IS NULL OR expires_at > ?)""",
+                (fts_query, _now()),
+            ).fetchall()
+            results.extend(Node.from_row(r) for r in rows if r["layer"] in wanted)
 
     return results
+
+
+def _fts_match_query(query: str) -> str:
+    """Turn free text into a safe FTS5 MATCH expression: each term quoted as
+    a literal phrase (so FTS5 operator characters in the input, e.g. a stray
+    `*` or `:`, can't produce a syntax error or an unintended query), joined
+    with OR (matching any term, same recall behavior as the old substring
+    scan). Empty/whitespace-only input yields no query at all."""
+    terms = [t for t in query.split() if t]
+    if not terms:
+        return ""
+    return " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
 
 
 def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
@@ -238,7 +307,7 @@ def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
     ).fetchall()
     for row in expired:
         node = Node.from_row(row)
-        _log_edit(conn, node.id, actor, {"pruned_expired": True}, node.hash)
+        _advance(conn, node.id, node.hash, {"pruned_expired": True}, actor)
         conn.execute("DELETE FROM nodes WHERE id = ?", (node.id,))
         pruned.append(node.id)
 
@@ -251,12 +320,11 @@ def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
         if node.layer not in _PROMOTE_TO:
             continue
         new_layer = _PROMOTE_TO[node.layer]
-        chain_hash = _hash_of(node.id, "consolidate_promote", new_layer, node.hash)
+        chain_hash = _advance(conn, node.id, node.hash, {"promoted_to": new_layer}, actor)
         conn.execute(
             "UPDATE nodes SET layer = ?, expires_at = NULL, hash = ?, prev_hash = ? WHERE id = ?",
             (new_layer, chain_hash, node.hash, node.id),
         )
-        _log_edit(conn, node.id, actor, {"promoted_to": new_layer}, chain_hash)
         promoted.append({"id": node.id, "to": new_layer})
 
     conn.commit()

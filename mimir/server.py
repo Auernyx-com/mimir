@@ -60,6 +60,8 @@ class MimirHandler(BaseHTTPRequestHandler):
                 self._ok(asdict(node))
             elif self.path == "/consolidate":
                 self._ok(storage.consolidate(self.conn))
+            elif self.path == "/verify_chain":
+                self._ok(storage.verify_chain(self.conn, body["node_id"]))
             elif self.path == "/resolve_conflict":
                 storage.resolve_conflict(self.conn, body["conflict_id"], body["resolution"])
                 self._ok({"resolved": True})
