@@ -448,6 +448,39 @@ def resolve_conflict(conn: sqlite3.Connection, conflict_id: str, resolution: str
     conn.commit()
 
 
+def resolve_conflict_by_choosing(
+    conn: sqlite3.Connection, conflict_id: str, winner_node_id: str, actor: str,
+) -> None:
+    """Actually resolve a same-layer conflict, not just mark the conflict
+    row closed — found missing during real use: resolve_conflict() alone
+    leaves every competing node still live (superseded_by IS NULL on all of
+    them), so recall() would keep returning every loser right alongside the
+    winner forever. This marks every OTHER node in the conflict as
+    superseded_by=winner_node_id (advancing each one's own hash chain, same
+    as write_node's cross-layer supersede path) and closes the conflict in
+    one call, so a human/session choosing a winner actually takes effect."""
+    row = conn.execute("SELECT * FROM conflicts WHERE id = ?", (conflict_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"no such conflict: {conflict_id}")
+    node_ids = json.loads(row["node_ids"])
+    if winner_node_id not in node_ids:
+        raise ValueError(f"{winner_node_id!r} is not one of this conflict's nodes: {node_ids}")
+
+    for loser_id in node_ids:
+        if loser_id == winner_node_id:
+            continue
+        loser = conn.execute("SELECT * FROM nodes WHERE id = ?", (loser_id,)).fetchone()
+        if loser is None or loser["superseded_by"] is not None:
+            continue  # already gone or already superseded by something else
+        new_hash = _advance(conn, loser_id, loser["hash"], {"superseded_by": winner_node_id}, actor)
+        conn.execute(
+            "UPDATE nodes SET superseded_by = ?, hash = ?, prev_hash = ? WHERE id = ?",
+            (winner_node_id, new_hash, loser["hash"], loser_id),
+        )
+
+    resolve_conflict(conn, conflict_id, f"chose {winner_node_id}")
+
+
 # ── Links — minimal bookkeeping only ────────────────────────────────────────
 #
 # Deliberately not fused into write_node(): a node write partially succeeding

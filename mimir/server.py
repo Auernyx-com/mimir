@@ -79,6 +79,11 @@ class MimirHandler(BaseHTTPRequestHandler):
             elif self.path == "/resolve_conflict":
                 storage.resolve_conflict(self.conn, body["conflict_id"], body["resolution"])
                 self._ok({"resolved": True})
+            elif self.path == "/resolve_conflict_by_choosing":
+                storage.resolve_conflict_by_choosing(
+                    self.conn, body["conflict_id"], body["winner_node_id"], body.get("actor", "unknown"),
+                )
+                self._ok({"resolved": True})
             elif self.path == "/link":
                 storage.add_link(self.conn, body["from_id"], body["to_id"])
                 self._ok({"linked": True})

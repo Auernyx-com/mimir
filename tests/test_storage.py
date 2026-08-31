@@ -365,6 +365,38 @@ def test_revise_node_is_a_noop_when_nothing_actually_changes():
     assert revised.hash == node.hash  # no new edit_log entry, hash unchanged
 
 
+def test_resolve_conflict_by_choosing_actually_supersedes_the_losers():
+    """Gap found during real use: resolve_conflict() alone closes the
+    conflict record but leaves every competing node still live — recall()
+    would keep returning every loser forever. This must actually mark them
+    superseded, not just mark the paperwork done."""
+    conn = _fresh_conn()
+    a = storage.write_node(conn, layer="branch", topic="pick-one", content="A", authored_by="t", origin_machine="t")
+    b = storage.write_node(conn, layer="branch", topic="pick-one", content="B", authored_by="t", origin_machine="t")
+    c = storage.write_node(conn, layer="branch", topic="pick-one", content="C", authored_by="t", origin_machine="t")
+    conflict_id = storage.list_conflicts(conn)[0]["id"]
+
+    storage.resolve_conflict_by_choosing(conn, conflict_id, a.id, actor="t")
+
+    assert storage.list_conflicts(conn) == []  # conflict actually closed
+    live = conn.execute("SELECT id FROM nodes WHERE topic='pick-one' AND superseded_by IS NULL").fetchall()
+    assert [r["id"] for r in live] == [a.id]  # only the winner is still live
+    for loser_id in (b.id, c.id):
+        assert storage.verify_chain(conn, loser_id)["valid"] is True  # losers' own chains still intact
+
+
+def test_resolve_conflict_by_choosing_rejects_a_node_not_in_the_conflict():
+    conn = _fresh_conn()
+    storage.write_node(conn, layer="branch", topic="x", content="A", authored_by="t", origin_machine="t")
+    storage.write_node(conn, layer="branch", topic="x", content="B", authored_by="t", origin_machine="t")
+    conflict_id = storage.list_conflicts(conn)[0]["id"]
+    try:
+        storage.resolve_conflict_by_choosing(conn, conflict_id, "not-a-real-node-id", actor="t")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
 def test_verify_chain_passes_on_untampered_node():
     conn = _fresh_conn()
     node = storage.write_node(
