@@ -19,7 +19,17 @@ from . import GATED_LAYERS, LAYERS, DEFAULT_PROMOTION_THRESHOLD
 # lower index always wins a same-topic collision against a higher index.
 _LAYER_RANK = {layer: i for i, layer in enumerate(LAYERS)}
 
-_PROMOTE_TO = {"leaf": "branch", "branch": "trunk"}
+# Automatic promotion (confirm_node / consolidate) stops at branch, on
+# purpose — it must never be able to reach a gated layer. A real bug found
+# here during hardening: with "branch": "trunk" included, an unauthenticated
+# leaf node ("trust me", authored_by="anyone", zero authorization anywhere)
+# reached trunk after 4 plain confirmations, completely bypassing the
+# authorization gate write_node enforces for direct trunk writes. Elevating
+# a branch fact to trunk is only ever reachable through an explicit,
+# authorized write_node() call to the same topic — which already works via
+# the existing precedence rules (a trunk write supersedes a branch node on
+# the same topic) — never through repetition alone. See SPEC.md §3.
+_PROMOTE_TO = {"leaf": "branch"}
 
 
 def _now() -> str:
@@ -311,8 +321,10 @@ def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
         conn.execute("DELETE FROM nodes WHERE id = ?", (node.id,))
         pruned.append(node.id)
 
+    # layer = 'leaf' explicitly, not "in _PROMOTE_TO", so this query stays
+    # correct on its own even if _PROMOTE_TO's shape ever changes again.
     stale_promotable = conn.execute(
-        "SELECT * FROM nodes WHERE layer IN ('leaf','branch') AND confirmations >= ?",
+        "SELECT * FROM nodes WHERE layer = 'leaf' AND confirmations >= ?",
         (DEFAULT_PROMOTION_THRESHOLD,),
     ).fetchall()
     for row in stale_promotable:
@@ -337,8 +349,17 @@ def list_conflicts(conn: sqlite3.Connection) -> list[dict]:
 
 
 def resolve_conflict(conn: sqlite3.Connection, conflict_id: str, resolution: str) -> None:
-    conn.execute(
-        "UPDATE conflicts SET resolved_at = ?, resolution = ? WHERE id = ?",
+    """Raises KeyError for an unknown conflict_id rather than silently
+    no-op'ing — found during hardening: the UPDATE below "succeeds" (0 rows
+    affected is not an error to SQLite) whether or not conflict_id is real,
+    so a typo'd or already-resolved ID would otherwise get reported back to
+    a caller as {"resolved": true}, which is actively false."""
+    cur = conn.execute(
+        "UPDATE conflicts SET resolved_at = ?, resolution = ? WHERE id = ? AND resolved_at IS NULL",
         (_now(), resolution, conflict_id),
     )
+    if cur.rowcount == 0:
+        exists = conn.execute("SELECT 1 FROM conflicts WHERE id = ?", (conflict_id,)).fetchone()
+        reason = "already resolved" if exists else "no such conflict"
+        raise KeyError(f"cannot resolve conflict {conflict_id!r}: {reason}")
     conn.commit()

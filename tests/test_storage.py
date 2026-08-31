@@ -146,6 +146,56 @@ def test_recall_works_after_reopening_a_database_created_before_fts_existed():
     )
 
 
+def test_confirmation_alone_can_never_reach_a_gated_layer():
+    """Regression test for a real vulnerability found during hardening: an
+    unauthenticated leaf node ("trust me", authored_by="anyone", zero
+    authorization anywhere) reached trunk — the gated, authorization-
+    required layer — after just 4 plain confirm_node() calls, completely
+    bypassing the exact gate write_node() enforces for a direct trunk
+    write. Automatic promotion must stop at branch, always, no matter how
+    many times a node is reconfirmed. Reaching trunk must require an
+    explicit, authorized write_node() call — never repetition alone."""
+    conn = _fresh_conn()
+    node = storage.write_node(
+        conn, layer="leaf", topic="suspicious.claim", content="trust me",
+        authored_by="anyone", origin_machine="citadel-2.0",
+    )
+    for _ in range(15):
+        node = storage.confirm_node(conn, node.id, actor="anyone")
+    assert node.layer == "branch", f"expected promotion to cap at branch, got {node.layer!r}"
+    assert node.layer not in storage.GATED_LAYERS
+
+    # consolidate()'s promotion sweep must respect the same cap.
+    result = storage.consolidate(conn)
+    row = conn.execute("SELECT layer FROM nodes WHERE id = ?", (node.id,)).fetchone()
+    assert row["layer"] == "branch", "consolidate() must not promote past branch either"
+
+
+def test_resolve_conflict_rejects_unknown_id():
+    """Regression test: resolve_conflict used to silently no-op on a fake
+    ID — SQLite doesn't treat a 0-row UPDATE as an error — which meant a
+    caller got {"resolved": true} back for something that never happened."""
+    conn = _fresh_conn()
+    try:
+        storage.resolve_conflict(conn, "does-not-exist", "picked A")
+        assert False, "expected KeyError"
+    except KeyError:
+        pass
+
+
+def test_resolve_conflict_rejects_already_resolved_id():
+    conn = _fresh_conn()
+    storage.write_node(conn, layer="branch", topic="dup", content="A", authored_by="t", origin_machine="t")
+    storage.write_node(conn, layer="branch", topic="dup", content="B", authored_by="t", origin_machine="t")
+    conflict_id = storage.list_conflicts(conn)[0]["id"]
+    storage.resolve_conflict(conn, conflict_id, "picked A")
+    try:
+        storage.resolve_conflict(conn, conflict_id, "picked B")
+        assert False, "expected KeyError on double-resolve"
+    except KeyError:
+        pass
+
+
 def test_verify_chain_passes_on_untampered_node():
     conn = _fresh_conn()
     node = storage.write_node(
