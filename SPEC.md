@@ -54,12 +54,25 @@ Everything Mimir stores is a **node** — one atomic fact, rule, or reference.
 | `content` | The fact itself |
 | `description` | One-line summary, used for index-level recall matching |
 | `tags` | Keywords for retrieval |
-| `links` | IDs of related nodes |
 | `confirmations` | Times reconfirmed across sessions — drives promotion |
 | `created_at` / `last_confirmed_at` / `expires_at` | `expires_at` is leaf-only |
 | `authored_by` | Session/program identity string |
 | `origin_machine` | Which machine wrote this node (`citadel-2.0`, `echo-station`, `avrs-trunk`, …) — cheap to carry from day one, real surgery to back-fill later |
 | `hash` / `prev_hash` | Hash-chain link, **per node** — not one global chain |
+
+### Links — minimal bookkeeping, not a node field
+
+Related-node references live in their own table (`links(from_id, to_id)`,
+§4), not as a field set at write time — `add_link()` / `get_links()` /
+`remove_link()` operate on already-existing nodes only, deliberately kept
+independent of `write_node()` (a node write partially succeeding while a
+requested link target turns out invalid isn't an ambiguity worth creating).
+`get_links()` returns both directions labeled separately (`outgoing` /
+`incoming`), since "this node references X" and "X references this node"
+mean different things. **`recall()` does not traverse links** — this is
+record-keeping, not graph expansion; making recall link-aware is a real,
+separate decision if it's ever wanted (hop limits, cycles, which layers it
+applies to), not something to fold in by default.
 
 ### Layer mechanics
 
@@ -76,12 +89,18 @@ actual lifecycle — decay by default, promotion by evidence.
   freely within a project's scope.
 - **Leaf — short-term.** Carries an `expires_at`. Decays and gets pruned
   automatically — *unless* it's reconfirmed across separate sessions, at
-  which point it consolidates upward into branch (or trunk, if it turns out
-  to be a standing rule).
+  which point it consolidates upward into branch.
 
 That promotion step is the actual learning mechanism. A fact earns a
 permanent home by surviving repeated contact with reality, not by being
-asserted once and filed away.
+asserted once and filed away. **Automatic promotion stops at branch,
+always** — found during hardening that this needed to be an explicit rule,
+not an assumption: without a cap, a completely unauthenticated node could
+reach trunk through repeated confirmation alone, fully bypassing the
+authorization gate `write_node()` enforces for a direct trunk write.
+Elevating a branch fact to trunk requires an explicit, authorized
+`write_node()` call to the same topic — which already works via the
+precedence rules above — never repetition by itself.
 
 #### Looking further out — the Aspen Model (conditional on AVRS's own growth)
 
@@ -131,7 +150,13 @@ edit_log(
 )  -- append-only, hash-chained per node
 
 conflicts(
-  id, topic, node_a, node_b, detected_at, resolved_at, resolution
+  -- one accumulating record per (topic, layer), not one row per colliding
+  -- pair — the original node_a/node_b-pair design was O(n^2) in the number
+  -- of colliding writes (measured: 6 same-layer writes to one topic -> 15
+  -- rows). node_ids (JSON array) holds every node still competing. A unique
+  -- partial index on (topic, layer) WHERE resolved_at IS NULL makes "at
+  -- most one open conflict per collision" a database-enforced invariant.
+  id, topic, layer, node_ids, detected_at, resolved_at, resolution
 )
 ```
 
@@ -166,8 +191,12 @@ POST /recall          { query, context, layers? }
 POST /write            { node, layer, authorized_by?, confirmation? }
 POST /confirm          { node_id }
 POST /consolidate      {}
+POST /verify_chain     { node_id }
 GET  /conflicts
 POST /resolve_conflict { conflict_id, resolution }
+POST /link             { from_id, to_id }
+POST /unlink           { from_id, to_id }
+POST /links            { node_id }
 ```
 
 `write` at `root`/`trunk` requires `authorized_by` + `confirmation: true`.
