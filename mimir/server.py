@@ -108,6 +108,8 @@ class MimirHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/conflicts":
             self._ok(storage.list_conflicts(self.conn))
+        elif self.path == "/archived":
+            self._ok([asdict(n) for n in storage.list_archived(self.conn)])
         else:
             self._fail(404, "unknown_route", f"no such route: {self.path}")
 

@@ -24,12 +24,18 @@ CREATE TABLE IF NOT EXISTS nodes (
     origin_machine  TEXT NOT NULL,
     hash            TEXT NOT NULL,
     prev_hash       TEXT,                  -- per-node chain, NOT a global sequence
-    superseded_by   TEXT REFERENCES nodes(id)
+    superseded_by   TEXT REFERENCES nodes(id),
+    archived_at     TEXT                    -- see FAILED_CLOSED law: sealed and
+                                             -- dormant, never deleted. Set when a
+                                             -- leaf expires unconfirmed; excluded
+                                             -- from normal recall() but the row
+                                             -- and its full edit_log stay forever.
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_topic ON nodes(topic);
 CREATE INDEX IF NOT EXISTS idx_nodes_layer ON nodes(layer);
 CREATE INDEX IF NOT EXISTS idx_nodes_expires ON nodes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_nodes_archived ON nodes(archived_at);
 
 CREATE TABLE IF NOT EXISTS links (
     from_id TEXT NOT NULL REFERENCES nodes(id),
@@ -39,9 +45,10 @@ CREATE TABLE IF NOT EXISTS links (
 
 CREATE TABLE IF NOT EXISTS edit_log (
     id       TEXT PRIMARY KEY,
-    node_id  TEXT NOT NULL,   -- deliberately not a FK: edit_log must outlive
-                               -- a pruned node (see storage.consolidate) —
-                               -- it's the durable record of what existed.
+    node_id  TEXT NOT NULL,   -- deliberately not a FK, kept even though nodes
+                               -- are never actually deleted now (see
+                               -- archived_at above) — no reason to couple
+                               -- this table's integrity to that guarantee.
     at       TEXT NOT NULL,
     actor    TEXT NOT NULL,
     diff     TEXT NOT NULL,   -- JSON
@@ -147,6 +154,19 @@ def _migrate_conflicts_table_if_needed(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_archived_column_if_needed(conn: sqlite3.Connection) -> None:
+    """Add archived_at to a nodes table that predates it. Must run before
+    the schema is a no-op via CREATE TABLE IF NOT EXISTS, same pattern as
+    the conflicts-table migration above — an existing table is left
+    completely untouched by that statement, column and all."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+    if not cols:
+        return  # table doesn't exist yet — CREATE TABLE will make it correctly
+    if "archived_at" not in cols:
+        conn.execute("ALTER TABLE nodes ADD COLUMN archived_at TEXT")
+        conn.commit()
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     """Open (and if needed, initialize) one instance's database file.
 
@@ -172,6 +192,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     ).fetchone()[0] > 0
 
     _migrate_conflicts_table_if_needed(conn)
+    _migrate_archived_column_if_needed(conn)
 
     conn.executescript(SCHEMA)
 

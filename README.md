@@ -35,8 +35,13 @@ curl -s -X POST localhost:8420/recall -d '{"query": "saw"}'
 # Reconfirm a leaf fact — 3 reconfirmations promotes it to branch
 curl -s -X POST localhost:8420/confirm -d '{"node_id": "<id from write above>"}'
 
-# Sweep: prune expired unconfirmed leaf nodes, promote anything that crossed threshold
+# Sweep: archive expired unconfirmed leaf nodes (never deleted — see
+# list_archived below), promote anything that crossed threshold
 curl -s -X POST localhost:8420/consolidate -d '{}'
+
+# Nothing Mimir stores is ever actually deleted — an archived node's full
+# content and history stay reachable here
+curl -s localhost:8420/archived
 ```
 
 ## Running the tests

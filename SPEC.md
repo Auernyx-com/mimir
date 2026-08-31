@@ -59,6 +59,8 @@ Everything Mimir stores is a **node** — one atomic fact, rule, or reference.
 | `authored_by` | Session/program identity string |
 | `origin_machine` | Which machine wrote this node (`citadel-2.0`, `echo-station`, `avrs-trunk`, …) — cheap to carry from day one, real surgery to back-fill later |
 | `hash` / `prev_hash` | Hash-chain link, **per node** — not one global chain |
+| `superseded_by` | Set when a higher-layer write wins a topic collision — the loser stays in the database, just excluded from `recall()` |
+| `archived_at` | Set when a leaf expires unconfirmed — same principle: excluded from `recall()`, never deleted (see Layer mechanics above) |
 
 ### Links — minimal bookkeeping, not a node field
 
@@ -87,9 +89,15 @@ actual lifecycle — decay by default, promotion by evidence.
   logged act. Touched rarely, on purpose.
 - **Branch — working memory.** Normal domain knowledge. Read and write
   freely within a project's scope.
-- **Leaf — short-term.** Carries an `expires_at`. Decays and gets pruned
-  automatically — *unless* it's reconfirmed across separate sessions, at
-  which point it consolidates upward into branch.
+- **Leaf — short-term.** Carries an `expires_at`. Decays out of active
+  recall automatically — *unless* it's reconfirmed across separate
+  sessions, at which point it consolidates upward into branch. **Decay is
+  never deletion** — an expired leaf is marked `archived_at` and excluded
+  from `recall()`, but the row, its content, and its full `edit_log`
+  history stay in the database permanently, reachable via
+  `list_archived()`. Same principle as `FAILED_CLOSED` elsewhere in this
+  project: sealed and dormant, not erased. Nothing Mimir stores is ever
+  actually deleted, full stop — decay changes visibility, never existence.
 
 That promotion step is the actual learning mechanism. A fact earns a
 permanent home by surviving repeated contact with reality, not by being
@@ -187,16 +195,19 @@ PowerShell can all call it the same way a Mk2 addon like Skjoldr already
 gets called.
 
 ```
-POST /recall          { query, context, layers? }
-POST /write            { node, layer, authorized_by?, confirmation? }
-POST /confirm          { node_id }
-POST /consolidate      {}
-POST /verify_chain     { node_id }
+POST /recall                     { query, context, layers? }
+POST /write                       { node, layer, authorized_by?, confirmation? }
+POST /confirm                     { node_id }
+POST /revise                      { node_id, content?, description? }
+POST /consolidate                 {}
+POST /verify_chain                { node_id }
 GET  /conflicts
-POST /resolve_conflict { conflict_id, resolution }
-POST /link             { from_id, to_id }
-POST /unlink           { from_id, to_id }
-POST /links            { node_id }
+GET  /archived
+POST /resolve_conflict            { conflict_id, resolution }
+POST /resolve_conflict_by_choosing { conflict_id, winner_node_id }
+POST /link                        { from_id, to_id }
+POST /unlink                      { from_id, to_id }
+POST /links                       { node_id }
 ```
 
 `write` at `root`/`trunk` requires `authorized_by` + `confirmation: true`.

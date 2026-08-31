@@ -464,16 +464,34 @@ def test_supersede_actually_advances_the_superseded_nodes_hash():
     assert result["valid"] is True
 
 
-def test_consolidate_prunes_expired_unconfirmed_leaf():
+def test_consolidate_archives_expired_leaf_but_never_deletes_it():
+    """Regression test for a real design flaw found via direct user
+    instruction: consolidate() used to issue DELETE FROM nodes on expired
+    leaf facts. Justin's own words: "you will not delet or remove
+    anything... to remove them is to remove history." This must archive
+    (excluded from normal recall, fully preserved and inspectable) —
+    never actually delete anything, ever."""
     conn = _fresh_conn()
     node = storage.write_node(
-        conn, layer="leaf", topic="temp.fact", content="short-lived",
+        conn, layer="leaf", topic="temp.fact", content="short-lived but real",
         authored_by="test", origin_machine="test-machine", leaf_ttl_days=-1,  # already expired
     )
     result = storage.consolidate(conn)
-    assert node.id in result["pruned"]
-    remaining = storage.recall(conn, query="temp", layers=["leaf"])
+    assert node.id in result["archived"]
+
+    # Excluded from normal recall...
+    remaining = storage.recall(conn, query="short-lived", layers=["leaf"])
     assert all(n.id != node.id for n in remaining)
+
+    # ...but the row, its content, and its full history are still there.
+    row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone()
+    assert row is not None, "the node must still physically exist in the database"
+    assert row["content"] == "short-lived but real"
+    assert row["archived_at"] is not None
+    assert storage.verify_chain(conn, node.id)["valid"] is True
+
+    archived = storage.list_archived(conn)
+    assert any(n.id == node.id for n in archived), "archived nodes must be findable, not just theoretically present"
 
 
 if __name__ == "__main__":

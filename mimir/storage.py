@@ -76,6 +76,7 @@ class Node:
     hash: str = ""
     prev_hash: str | None = None
     superseded_by: str | None = None
+    archived_at: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Node":
@@ -304,7 +305,7 @@ def recall(conn: sqlite3.Connection, query: str = "", layers: list[str] | None =
 
     if "root" in wanted or "trunk" in wanted:
         rows = conn.execute(
-            "SELECT * FROM nodes WHERE layer IN ('root','trunk') AND superseded_by IS NULL"
+            "SELECT * FROM nodes WHERE layer IN ('root','trunk') AND superseded_by IS NULL AND archived_at IS NULL"
         ).fetchall()
         results.extend(Node.from_row(r) for r in rows if r["layer"] in wanted)
 
@@ -322,6 +323,7 @@ def recall(conn: sqlite3.Connection, query: str = "", layers: list[str] | None =
                        WHERE rowid IN (SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?)
                          AND layer IN ('branch','leaf')
                          AND superseded_by IS NULL
+                         AND archived_at IS NULL
                          AND (expires_at IS NULL OR expires_at > ?)""",
                 (fts_query, _now()),
             ).fetchall()
@@ -343,23 +345,35 @@ def _fts_match_query(query: str) -> str:
 
 
 def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
-    """The decay/promotion sweep. Prunes expired, never-reconfirmed leaf
+    """The decay/promotion sweep. Archives expired, never-reconfirmed leaf
     nodes; promotes anything that crossed the threshold outside of an
-    explicit confirm_node call. Every prune is logged before the row is
-    removed — the edit_log stays the durable record of what existed and why
-    it left, even once the live node is gone."""
+    explicit confirm_node call.
+
+    Archiving is NOT deletion — this used to issue a hard DELETE, which is
+    exactly what FAILED_CLOSED already establishes as the wrong model
+    elsewhere in this project ("sealed and dormant, not deleted... don't
+    treat it as something to clean up or remove; it's an intentional,
+    inspectable stop"). Justin's own words, directly: "you will not delet
+    or remove anything... to remove them is to remove history." An expired
+    leaf node is marked archived_at and excluded from normal recall() —
+    the row, its full content, and its entire edit_log stay in the
+    database forever, still reachable via list_archived()."""
     now = _now()
-    pruned, promoted = [], []
+    archived, promoted = [], []
 
     expired = conn.execute(
-        "SELECT * FROM nodes WHERE layer = 'leaf' AND expires_at IS NOT NULL AND expires_at <= ? AND confirmations < ?",
+        "SELECT * FROM nodes WHERE layer = 'leaf' AND expires_at IS NOT NULL AND expires_at <= ? "
+        "AND confirmations < ? AND archived_at IS NULL",
         (now, DEFAULT_PROMOTION_THRESHOLD),
     ).fetchall()
     for row in expired:
         node = Node.from_row(row)
-        _advance(conn, node.id, node.hash, {"pruned_expired": True}, actor)
-        conn.execute("DELETE FROM nodes WHERE id = ?", (node.id,))
-        pruned.append(node.id)
+        new_hash = _advance(conn, node.id, node.hash, {"archived_expired": True}, actor)
+        conn.execute(
+            "UPDATE nodes SET archived_at = ?, hash = ?, prev_hash = ? WHERE id = ?",
+            (now, new_hash, node.hash, node.id),
+        )
+        archived.append(node.id)
 
     # layer = 'leaf' explicitly, not "in _PROMOTE_TO", so this query stays
     # correct on its own even if _PROMOTE_TO's shape ever changes again.
@@ -380,7 +394,15 @@ def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
         promoted.append({"id": node.id, "to": new_layer})
 
     conn.commit()
-    return {"pruned": pruned, "promoted": promoted}
+    return {"archived": archived, "promoted": promoted}
+
+
+def list_archived(conn: sqlite3.Connection) -> list[Node]:
+    """The other half of "archived, never deleted" actually meaning
+    something — a real way to see what's back there, not just a promise
+    that it exists. Returns every archived node regardless of layer."""
+    rows = conn.execute("SELECT * FROM nodes WHERE archived_at IS NOT NULL ORDER BY archived_at DESC")
+    return [Node.from_row(r) for r in rows]
 
 
 def list_conflicts(conn: sqlite3.Connection) -> list[dict]:
