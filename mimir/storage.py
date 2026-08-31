@@ -393,6 +393,44 @@ def list_conflicts(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
+def revise_node(
+    conn: sqlite3.Connection, node_id: str, *, content: str | None = None,
+    description: str | None = None, actor: str,
+) -> Node:
+    """Update an existing node's own content in place — found missing during
+    real use, not designed up front: write_node()'s same-topic collision
+    logic is for two DIFFERENT sources disagreeing on a fact, not a single
+    author revising/expanding their own existing entry over time. Using
+    write_node() for that would create a same-layer conflict record every
+    time a memory file gets improved, which is wrong — a revision isn't a
+    disagreement. This operates on a known node_id directly, advances the
+    hash chain like confirm_node does, and never touches the conflicts
+    table at all."""
+    row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"no such node: {node_id}")
+    node = Node.from_row(row)
+
+    new_content = node.content if content is None else content
+    new_description = node.description if description is None else description
+    diff = {}
+    if content is not None and content != node.content:
+        diff["content_changed"] = True
+    if description is not None and description != node.description:
+        diff["description_changed"] = True
+    if not diff:
+        return node  # no-op revise — nothing actually changed
+
+    now = _now()
+    chain_hash = _advance(conn, node.id, node.hash, diff, actor)
+    conn.execute(
+        "UPDATE nodes SET content = ?, description = ?, last_confirmed_at = ?, hash = ?, prev_hash = ? WHERE id = ?",
+        (new_content, new_description, now, chain_hash, node.hash, node.id),
+    )
+    conn.commit()
+    return Node.from_row(conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone())
+
+
 def resolve_conflict(conn: sqlite3.Connection, conflict_id: str, resolution: str) -> None:
     """Raises KeyError for an unknown conflict_id rather than silently
     no-op'ing — found during hardening: the UPDATE below "succeeds" (0 rows

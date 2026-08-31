@@ -66,6 +66,12 @@ class MimirHandler(BaseHTTPRequestHandler):
             elif self.path == "/confirm":
                 node = storage.confirm_node(self.conn, body["node_id"], body.get("actor", "unknown"))
                 self._ok(asdict(node))
+            elif self.path == "/revise":
+                node = storage.revise_node(
+                    self.conn, body["node_id"], content=body.get("content"),
+                    description=body.get("description"), actor=body.get("actor", "unknown"),
+                )
+                self._ok(asdict(node))
             elif self.path == "/consolidate":
                 self._ok(storage.consolidate(self.conn))
             elif self.path == "/verify_chain":

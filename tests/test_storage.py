@@ -333,6 +333,38 @@ def test_remove_link_is_safe_on_a_link_that_never_existed():
     assert storage.get_links(conn, a.id) == {"outgoing": [], "incoming": []}
 
 
+def test_revise_node_updates_content_without_creating_a_conflict():
+    """Gap found during real use: expanding an existing memory entry's own
+    content must not look like a same-layer disagreement."""
+    conn = _fresh_conn()
+    node = storage.write_node(
+        conn, layer="branch", topic="a-topic", content="v1", authored_by="t", origin_machine="t",
+    )
+    revised = storage.revise_node(conn, node.id, content="v2, expanded", actor="t")
+    assert revised.content == "v2, expanded"
+    assert revised.id == node.id  # same node, not a new one
+    assert len(storage.list_conflicts(conn)) == 0
+    assert storage.verify_chain(conn, node.id)["valid"] is True
+
+
+def test_revise_node_rejects_unknown_id():
+    conn = _fresh_conn()
+    try:
+        storage.revise_node(conn, "does-not-exist", content="x", actor="t")
+        assert False, "expected NotFoundError"
+    except storage.NotFoundError:
+        pass
+
+
+def test_revise_node_is_a_noop_when_nothing_actually_changes():
+    conn = _fresh_conn()
+    node = storage.write_node(
+        conn, layer="branch", topic="b-topic", content="same", authored_by="t", origin_machine="t",
+    )
+    revised = storage.revise_node(conn, node.id, content="same", actor="t")
+    assert revised.hash == node.hash  # no new edit_log entry, hash unchanged
+
+
 def test_verify_chain_passes_on_untampered_node():
     conn = _fresh_conn()
     node = storage.write_node(
