@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Instance data never belongs in this repo — each consumer's database is its
+# own isolated data, not framework code. See SPEC.md §9/§10.
+*.db
+*.db-journal
+*.db-wal
+instances/

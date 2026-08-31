@@ -1,0 +1,10 @@
+[project]
+name = "mimir"
+version = "0.1.0"
+description = "Memory framework: one schema/API/layer-mechanics engine, instantiated as a fully isolated instance per consumer"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
