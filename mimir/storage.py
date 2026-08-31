@@ -131,6 +131,27 @@ def verify_chain(conn: sqlite3.Connection, node_id: str) -> dict:
     return {"valid": True, "entries_verified": len(rows)}
 
 
+def _record_conflict(conn: sqlite3.Connection, topic: str, layer: str, node_ids: list[str], now: str) -> None:
+    """One accumulating conflict record per (topic, layer), not one row per
+    colliding pair — the original design created a new row for every
+    combination, O(n^2) in the number of colliding writes (measured: 6
+    same-layer writes to one topic -> 15 rows). The unique partial index on
+    (topic, layer) WHERE resolved_at IS NULL (see schema.py) makes "at most
+    one open conflict per collision" a database-enforced invariant."""
+    existing = conn.execute(
+        "SELECT * FROM conflicts WHERE topic = ? AND layer = ? AND resolved_at IS NULL",
+        (topic, layer),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO conflicts (id, topic, layer, node_ids, detected_at) VALUES (?,?,?,?,?)",
+            (str(uuid.uuid4()), topic, layer, json.dumps(sorted(set(node_ids))), now),
+        )
+    else:
+        merged = sorted(set(json.loads(existing["node_ids"])) | set(node_ids))
+        conn.execute("UPDATE conflicts SET node_ids = ? WHERE id = ?", (json.dumps(merged), existing["id"]))
+
+
 def write_node(
     conn: sqlite3.Connection,
     *,
@@ -198,13 +219,14 @@ def write_node(
         ),
     )
 
+    same_layer_others = [Node.from_row(r).id for r in existing if Node.from_row(r).layer == layer]
+    if same_layer_others:
+        _record_conflict(conn, topic, layer, [*same_layer_others, node_id], now)
+
     for row in existing:
         other = Node.from_row(row)
         if other.layer == layer:
-            conn.execute(
-                "INSERT INTO conflicts (id, topic, node_a, node_b, detected_at) VALUES (?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), topic, other.id, node_id, now),
-            )
+            pass  # handled once, above — not per-pair (see _record_conflict's docstring)
         elif _LAYER_RANK[layer] < _LAYER_RANK[other.layer]:
             # New node outranks the existing one — existing one is superseded.
             # This IS a real state change to `other`, so its chain advances
@@ -345,7 +367,12 @@ def consolidate(conn: sqlite3.Connection, actor: str = "system") -> dict:
 
 def list_conflicts(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT * FROM conflicts WHERE resolved_at IS NULL").fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["node_ids"] = json.loads(d["node_ids"])
+        out.append(d)
+    return out
 
 
 def resolve_conflict(conn: sqlite3.Connection, conflict_id: str, resolution: str) -> None:

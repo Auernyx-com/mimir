@@ -4,6 +4,7 @@ One instance = one database file = one consumer's fully isolated memory.
 Never shared across consumers — see SPEC.md §2, §8.
 """
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -49,15 +50,26 @@ CREATE TABLE IF NOT EXISTS edit_log (
 
 CREATE INDEX IF NOT EXISTS idx_editlog_node ON edit_log(node_id);
 
+-- One accumulating record per (topic, layer), not one row per colliding
+-- pair — found during hardening: the original node_a/node_b-pair design
+-- created a new row for every combination, O(n^2) in the number of
+-- colliding writes (measured: 6 same-layer writes to one topic -> 15
+-- rows). node_ids holds every node still competing for this collision, as
+-- a JSON array. The partial unique index below makes "at most one OPEN
+-- conflict per (topic, layer)" a database-enforced invariant, not just
+-- application logic that could drift.
 CREATE TABLE IF NOT EXISTS conflicts (
     id           TEXT PRIMARY KEY,
     topic        TEXT NOT NULL,
-    node_a       TEXT NOT NULL REFERENCES nodes(id),
-    node_b       TEXT NOT NULL REFERENCES nodes(id),
+    layer        TEXT NOT NULL,
+    node_ids     TEXT NOT NULL,   -- JSON array, all nodes competing for this (topic, layer)
     detected_at  TEXT NOT NULL,
     resolved_at  TEXT,
     resolution   TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_open_topic_layer
+    ON conflicts(topic, layer) WHERE resolved_at IS NULL;
 
 -- Branch/leaf recall relevance filtering runs through this, not a Python-side
 -- substring scan of every row — a scale test (scripts/scale_test.py) showed
@@ -89,6 +101,52 @@ END;
 """
 
 
+def _migrate_conflicts_table_if_needed(conn: sqlite3.Connection) -> None:
+    """One-time migration from the original node_a/node_b-pair conflicts
+    schema (O(n^2) rows per collision) to one accumulating record per
+    (topic, layer). Runs before CREATE TABLE IF NOT EXISTS, since that
+    would otherwise leave an old-shaped table untouched forever."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(conflicts)")}
+    if not cols or "node_a" not in cols:
+        return  # no conflicts table yet, or already migrated
+
+    old_rows = conn.execute("SELECT * FROM conflicts").fetchall()
+    conn.execute("ALTER TABLE conflicts RENAME TO conflicts_old_migrated")
+
+    groups: dict[tuple[str, str], dict] = {}
+    for row in old_rows:
+        node = conn.execute(
+            "SELECT layer FROM nodes WHERE id IN (?, ?) LIMIT 1", (row["node_a"], row["node_b"])
+        ).fetchone()
+        layer = node["layer"] if node else "unknown"  # both nodes gone — best-effort
+        key = (row["topic"], layer)
+        g = groups.setdefault(key, {
+            "id": row["id"], "node_ids": set(), "detected_at": row["detected_at"],
+            "resolved_at": row["resolved_at"], "resolution": row["resolution"],
+        })
+        g["node_ids"].update([row["node_a"], row["node_b"]])
+        g["detected_at"] = min(g["detected_at"], row["detected_at"])
+
+    conn.executescript("""
+        CREATE TABLE conflicts (
+            id TEXT PRIMARY KEY, topic TEXT NOT NULL, layer TEXT NOT NULL,
+            node_ids TEXT NOT NULL, detected_at TEXT NOT NULL,
+            resolved_at TEXT, resolution TEXT
+        );
+        CREATE UNIQUE INDEX idx_conflicts_open_topic_layer
+            ON conflicts(topic, layer) WHERE resolved_at IS NULL;
+    """)
+    for (topic, layer), g in groups.items():
+        conn.execute(
+            "INSERT INTO conflicts (id, topic, layer, node_ids, detected_at, resolved_at, resolution) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (g["id"], topic, layer, json.dumps(sorted(g["node_ids"])), g["detected_at"],
+             g["resolved_at"], g["resolution"]),
+        )
+    conn.execute("DROP TABLE conflicts_old_migrated")
+    conn.commit()
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     """Open (and if needed, initialize) one instance's database file.
 
@@ -112,6 +170,8 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     fts_existed_before = conn.execute(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
     ).fetchone()[0] > 0
+
+    _migrate_conflicts_table_if_needed(conn)
 
     conn.executescript(SCHEMA)
 

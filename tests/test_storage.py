@@ -2,6 +2,7 @@
 or, dependency-free: python tests/test_storage.py
 """
 
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -169,6 +170,87 @@ def test_confirmation_alone_can_never_reach_a_gated_layer():
     result = storage.consolidate(conn)
     row = conn.execute("SELECT layer FROM nodes WHERE id = ?", (node.id,)).fetchone()
     assert row["layer"] == "branch", "consolidate() must not promote past branch either"
+
+
+def test_migration_merges_old_pairwise_conflicts_into_one_record():
+    """The old node_a/node_b-pair schema is a real thing that could exist
+    on disk once any consumer is actually using this — verify connect()
+    migrates it correctly, not just that the new schema works on a fresh
+    database that never had the old shape."""
+    import uuid as _uuid
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    conn = sqlite3.connect(tmp.name)
+    conn.executescript("""
+        CREATE TABLE nodes (id TEXT PRIMARY KEY, layer TEXT, topic TEXT, content TEXT,
+            description TEXT DEFAULT '', tags TEXT DEFAULT '[]', created_at TEXT,
+            last_confirmed_at TEXT, expires_at TEXT, confirmations INTEGER DEFAULT 0,
+            authored_by TEXT, origin_machine TEXT, hash TEXT, prev_hash TEXT, superseded_by TEXT);
+        CREATE TABLE conflicts (id TEXT PRIMARY KEY, topic TEXT, node_a TEXT, node_b TEXT,
+            detected_at TEXT, resolved_at TEXT, resolution TEXT);
+    """)
+    a, b, c = str(_uuid.uuid4()), str(_uuid.uuid4()), str(_uuid.uuid4())
+    for nid in (a, b, c):
+        conn.execute(
+            "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (nid, "branch", "old-topic", "content", "", "[]", "2020-01-01", "2020-01-01",
+             None, 0, "t", "t", "h", None, None),
+        )
+    conn.execute(
+        "INSERT INTO conflicts (id, topic, node_a, node_b, detected_at) VALUES (?,?,?,?,?)",
+        (str(_uuid.uuid4()), "old-topic", a, b, "2020-01-01T00:00:00"),
+    )
+    conn.execute(
+        "INSERT INTO conflicts (id, topic, node_a, node_b, detected_at) VALUES (?,?,?,?,?)",
+        (str(_uuid.uuid4()), "old-topic", a, c, "2020-01-01T00:00:01"),
+    )
+    conn.commit()
+    conn.close()
+
+    reopened = schema.connect(tmp.name)
+    conflicts = storage.list_conflicts(reopened)
+    assert len(conflicts) == 1
+    assert conflicts[0]["layer"] == "branch"
+    assert set(conflicts[0]["node_ids"]) == {a, b, c}
+
+
+def test_repeated_same_layer_collisions_stay_one_record():
+    """Regression test for O(n^2) conflict growth found during hardening:
+    the original design created a new conflicts row per colliding PAIR, so
+    N writes to one contested topic created N*(N-1)/2 rows (measured: 6
+    writes -> 15 rows). Must stay exactly one accumulating record no
+    matter how many nodes pile onto the same (topic, layer) collision."""
+    conn = _fresh_conn()
+    ids = [
+        storage.write_node(
+            conn, layer="branch", topic="hammered", content=f"v{i}",
+            authored_by="t", origin_machine="t",
+        ).id
+        for i in range(20)
+    ]
+    conflicts = storage.list_conflicts(conn)
+    assert len(conflicts) == 1, f"expected 1 accumulating conflict, got {len(conflicts)}"
+    assert set(conflicts[0]["node_ids"]) == set(ids)
+
+
+def test_database_enforces_at_most_one_open_conflict_per_topic_and_layer():
+    """The invariant _record_conflict relies on (at most one open conflict
+    per topic+layer) is backed by a real unique index, not just careful
+    application code — confirm the database itself would reject a
+    violation, not just that the happy path avoids one."""
+    conn = _fresh_conn()
+    conn.execute(
+        "INSERT INTO conflicts (id, topic, layer, node_ids, detected_at) VALUES (?,?,?,?,?)",
+        ("c1", "dup-topic", "branch", '["a","b"]', "2020-01-01"),
+    )
+    try:
+        conn.execute(
+            "INSERT INTO conflicts (id, topic, layer, node_ids, detected_at) VALUES (?,?,?,?,?)",
+            ("c2", "dup-topic", "branch", '["c","d"]', "2020-01-01"),
+        )
+        assert False, "expected a UNIQUE constraint violation"
+    except sqlite3.IntegrityError:
+        pass
 
 
 def test_resolve_conflict_rejects_unknown_id():
