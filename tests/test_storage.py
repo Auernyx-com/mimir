@@ -17,6 +17,23 @@ def _fresh_conn():
     return schema.connect(tmp.name)
 
 
+def test_blank_topic_is_rejected():
+    """Regression test: an empty topic used to be silently accepted and
+    immediately collided with every other empty-topic node forever — topic
+    is the entire collision-detection key, so a blank one broke precedence
+    for that node without any error."""
+    conn = _fresh_conn()
+    for bad_topic in ("", "   ", "\t\n"):
+        try:
+            storage.write_node(
+                conn, layer="branch", topic=bad_topic, content="x",
+                authored_by="t", origin_machine="t",
+            )
+            assert False, f"expected ValueError for topic={bad_topic!r}"
+        except ValueError:
+            pass
+
+
 def test_root_write_requires_authorization():
     conn = _fresh_conn()
     try:

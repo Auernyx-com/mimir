@@ -39,6 +39,14 @@ class MimirHandler(BaseHTTPRequestHandler):
     def _fail(self, status: int, error_code: str, message: str) -> None:
         self._send(status, {"ok": False, "error_code": error_code, "message": message})
 
+    def send_error(self, code, message=None, explain=None) -> None:  # noqa: N802
+        """Override BaseHTTPRequestHandler's default: it renders an HTML
+        error page, which breaks the "clean JSON, no extra text" contract
+        every other error path here follows (found by actually sending an
+        unsupported method — DELETE returned a full HTML document, not
+        JSON, unlike every 4xx/5xx produced by do_POST/do_GET above)."""
+        self._fail(code, "http_error", message or "request error")
+
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's naming
         try:
             body = self._read_json()
@@ -69,7 +77,9 @@ class MimirHandler(BaseHTTPRequestHandler):
                 self._fail(404, "unknown_route", f"no such route: {self.path}")
         except storage.AuthorizationError as e:
             self._fail(403, "authorization_required", str(e))
-        except (KeyError, ValueError) as e:
+        except KeyError as e:
+            self._fail(400, "missing_field", f"missing required field: {e}")
+        except ValueError as e:
             self._fail(400, "bad_request", str(e))
         except Exception as e:  # noqa: BLE001 — mirrors SkjoldrCLI's top-level catch-all
             self._fail(500, "internal_error", str(e))

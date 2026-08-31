@@ -171,6 +171,13 @@ def write_node(
     topic collision rather than silently picking one."""
     if layer not in LAYERS:
         raise ValueError(f"unknown layer: {layer!r}")
+    if not topic or not topic.strip():
+        # A blank topic collides with every other blank-topic node forever
+        # (found during hardening: two empty-topic writes immediately
+        # created a conflict) — topic's entire purpose is to be a stable
+        # collision key, so an empty one silently breaks precedence/
+        # conflict detection for that node rather than erroring loudly.
+        raise ValueError("topic must be a non-empty string")
     if layer in GATED_LAYERS and not (authorized_by and confirmation):
         raise AuthorizationError(
             f"writing to layer={layer!r} requires authorized_by and confirmation=True"
