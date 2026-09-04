@@ -270,6 +270,27 @@ another's is a real requirement, not a nice-to-have.
   context, not the audit trail for actions taken.
 - No persona or identity layer of any kind — memory stays tool context,
   never identity, full stop.
+- **Not a general company-knowledge layer or a substitute for a system's own
+  audit/ledger — settled 2026-09-04, tested against real code, not assumed.**
+  Checked four real candidates in one session before writing this down:
+  Feneris (already has its own restart-surviving persistence — doesn't have
+  the statelessness problem this framework solves), AVRS's public demo page
+  (memory here risks leaking sensitive content to random visitors — same
+  shape as the standing "no capability feeds a public dashboard" rule,
+  applied to memory instead), SQUAD/Pathfinder (the client-side session
+  vault already does per-veteran memory correctly, client-side-only, real
+  Web Crypto, already audited — porting this framework into the browser
+  would re-solve a solved problem, and a server-side version would break
+  the zero-server-side-disclosure law that whole rebuild exists to uphold),
+  and Mk2's own `core/kintsugi/memory.ts` (real, hash-chained, genuine read
+  functions — but every read feeds chain-integrity verification or policy
+  reconciliation, never planning; nothing in `planner.ts`/`router.ts` reads
+  it back to inform a new decision — it's memory in the Kintsugi sense,
+  "the scar is part of the record," not in this framework's sense). The one
+  shape that actually fits: a stateless AI consumer with the same kind of
+  relationship across many otherwise-separate sessions and no persistence
+  of its own — Claude Code today, or an AI's own reasoning/planning recall
+  if one of Mk2's deployments ever needs it. Never the company data itself.
 
 ## 10. Open decisions
 
