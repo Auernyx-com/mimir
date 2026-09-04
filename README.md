@@ -72,4 +72,4 @@ fallback), and real consumer integrations (Mk2, Feneris, Skjoldr).
 
 ## Naming
 
-"Mimir" is a placeholder — see [SPEC.md](SPEC.md#naming).
+"Mimir" is final — see [SPEC.md](SPEC.md#naming) for why.

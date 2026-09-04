@@ -1,6 +1,6 @@
 # Mimir — Memory Framework
 
-**Status:** v0.1, draft. Name is provisional — see [Naming](#naming) below.
+**Status:** v0.1, draft.
 
 Not a shared memory store. A reusable **framework**: one schema, one API, one
 set of layer/consolidation/provenance mechanics — instantiated separately and
@@ -311,9 +311,7 @@ another's is a real requirement, not a nice-to-have.
 
 ## Naming
 
-This document uses "Mimir" as a placeholder. "Mnema" was raised as an
-alternative; its provenance is under active review (a specific origin story
-attached to that name was traced and found to have no external
-corroboration anywhere — see the Auernyx repo audit / Claude Code memory for
-detail). Naming stays open until that's resolved; nothing in this design
-depends on the answer.
+"Mimir" is final, not a placeholder. Chosen deliberately over "Mnema" —
+that name is already a distinct, separately-named aspect of AVRS, and
+reusing it here would have collided with a real existing concept. Nothing
+in this design ever depended on the answer either way.
